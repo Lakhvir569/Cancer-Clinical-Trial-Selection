@@ -1,0 +1,360 @@
+---
+title: "MBAn 556 Exam"
+author: "Lakhvir Sohal"
+date: "2025-12-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This analysis uses the Cancer Diagnoses dataset from HW4 (WBC) to help Michigan Medicine prepare for a new clinical trial. The trial is expected to be highly effective but it is also extremely expensive, which means the hospital must be very selective when deciding who qualifies for enrollment. The goal of this work is therefore not to find every cancer patient in the dataset. Instead, the objective is to identify a small group of patients who are very likely to have cancer.
+
+Success in this analysis is measured by Precision, defined as the number of true cancer cases correctly identified out of all patients predicted to have cancer. Precision is the most important metric because Michigan Medicine wants to avoid false positives. At the same time, the clinical trial can only begin if we identify at least seven true cancer patients, so the method must achieve this minimum number while maintaining high precision.
+
+Using unsupervised learning techniques, this analysis will search for patterns in the health indicator data that highlight the most likely cancer cases. All assumptions and parameter choices are stated clearly, and the goal throughout the work is to balance high precision with the requirement to identify at least seven true positive patients.
+
+# Loading and Cleaning the Dataset
+
+I begin by loading the WBC cancer dataset used previously in HW4. I check the structure of the data, confirm that all 30 predictors (X1 to X30) are numeric, and verify that there are no missing values. Since the predictors are already scaled between 0 and 1, no additional cleaning or transformation is needed. The outcome variable y is converted into a descriptive factor for easier evaluation later, although it is not used when training the unsupervised models.
+
+## Loading data
+
+```{r}
+library(tidyverse)
+wbc <- read.csv("wbc.csv")
+```
+
+## Inspecting structure and check for issues
+
+```{r}
+str(wbc)
+summary(wbc)
+sum(is.na(wbc))
+```
+
+## Convert outcome to factor for evaluation later
+
+```{r}
+wbc$y <- factor(wbc$y,levels = c(0,1),labels = c("NoCancer","Cancer"))
+```
+
+## Extract predictor variables
+
+```{r}
+wbc_X <- wbc %>% select(starts_with("X"))
+```
+
+# (Q1) Do a PCA to reduce dimensionality. You are asked to choose between capturing 90%, 95% or 97% of the variance. Explain your choice. Create a new dataset that has all the PCs needed for capturing your chosen level of variance. Use this dataset for the questions below.
+
+## Run PCA on the Dataset
+
+PCA is used to reduce dimensionality and remove correlation among the predictors. This helps simplify the structure and makes clustering and outlier detection more effective.
+
+```{r}
+pca <- prcomp(wbc_X, scale. = TRUE)
+var_exp <- pca$sdev^2 / sum(pca$sdev^2)
+cum_var <- cumsum(var_exp)
+```
+
+## Visualize Variance Using fviz_eig
+
+The scree plot below shows how much variance each principal component explains. This visual helps determine how many PCs should be kept.
+
+```{r}
+library(factoextra)
+fviz_eig(pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+The scree plot shows that the first several components explain most of the variance, and the curve begins to flatten after about the tenth component. This suggests that the major structure in the data is captured early and that the remaining components add only small amounts of information.
+
+## Select Number of Components for 95 Percent Variance
+
+I compare thresholds of 90 percent, 95 percent, and 97 percent.
+Ninety percent is more aggressive but risks removing useful structure.
+Ninety-seven percent keeps too many components and reduces the value of PCA.
+Ninety-five percent provides a good balance between information retention and dimensionality reduction.
+
+```{r}
+num_pc <- which(cum_var >= 0.95)[1]
+num_pc
+cum_var[1:num_pc]
+```
+
+This means that 11 principal components are needed to capture about 96 percent of the variance, which meets the 95 percent target and provides a strong reduction from the original 30 variables.
+
+## Create the Final PCA Dataset
+
+The new dataset below contains only the principal components needed to capture at least 95 percent of the variance. This dataset will be used in all remaining questions.
+
+```{r}
+pc_data <- as.data.frame(pca$x[, 1:num_pc])
+head(pc_data)
+```
+
+The resulting PC dataset captures the important structure in the original indicators while reducing noise and redundancy. This creates a cleaner foundation for clustering and outlier detection in the next steps.
+
+# (Q2) You are asked to build at least one outlier detection model to identify outliers and test the idea that we can use outlier detection as a cancer diagnoses methodology. You are asked to provide your rationale for choosing any needed parameter values that the models might need. 
+
+In this section I use the Local Outlier Factor method to measure how unusual each patient appears in the PCA-reduced space. A higher LOF score means the patient is further from their neighbors and may reflect an abnormal health profile. Since cancer cases are rare, this method helps test whether the most unusual patients are more likely to have cancer.
+
+The plot displays the LOF score for every patient as a vertical line. The tallest lines represent the most extreme outliers. I added a red line at the ninety-fifth percentile to help mark the most abnormal patients. When I look at the output, I see that only a small number of patients sit well above the red line. This confirms that only a few patients stand out as strong outliers worth focusing on.
+
+```{r}
+library(dbscan)
+set.seed(123)
+lof_scores <- lof(pc_data, minPts = 10)
+plot(lof_scores, type = "h", main = "LOF Outlier Scores", ylab = "Score")
+abline(h = quantile(lof_scores, 0.95), col = "red")
+```
+
+## Helper Function from HW 4
+
+Since the clinical trial is very costly, precision matters more than any other metric. Precision tells me what fraction of the patients I label as cancer actually turn out to have cancer. This helper function calculates the confusion matrix, the number of true positives, the number of false positives, and the resulting precision. I use this function to evaluate how well different LOF thresholds perform.
+
+```{r}
+evaluate_precision <- function(pred, true){
+  cm <- table(True = true, Pred = pred)
+  TP <- cm["Cancer","Cancer"]
+  FP <- cm["NoCancer","Cancer"]
+  precision <- TP / (TP + FP)
+  list(
+    confusion_matrix = cm,
+    TP = TP,
+    FP = FP,
+    precision = precision
+    )
+}
+```
+
+## Testing LOF Thresholds
+
+LOF produces a continuous score, so I need a threshold to decide which patients are classified as likely cancer. To find the best threshold, I test a range of LOF quantiles. For each threshold I classify the outliers as cancer, calculate precision, and count how many true cancer cases are captured. This helps me understand how strict or lenient I should be.
+
+```{r}
+thresholds <- seq(0.90, 0.995, by = 0.005)
+results <- data.frame()
+
+for (q in thresholds) {
+  thr <- quantile(lof_scores, q)
+  pred <- ifelse(lof_scores >= thr, "Cancer", "NoCancer")
+  pred <- factor(pred, levels = c("NoCancer","Cancer"))
+  res <- evaluate_precision(pred, wbc$y)
+  results <- rbind(results,
+                   data.frame(threshold = q,
+                             precision = res$precision, 
+                             TP = res$TP,
+                             FP = res$FP))
+  }
+head(results)
+```
+
+At these thresholds I consistently identify between nine and eleven true cancer cases, which all satisfy the requirement of at least seven. Precision in this range remains between about 0.29 and 0.33 because false positives remain relatively high. As I increase the threshold further, precision begins to improve sharply because the model focuses only on the most extreme outliers, although the number of true positives eventually drops.
+
+## Precision Curve
+
+The following plot shows how precision changes across the tested LOF thresholds. It gives me a clear picture of how strict or lenient I should be if my goal is to maximize precision while still identifying at least seven cancer patients.
+
+```{r}
+library(ggplot2)
+ggplot(results, aes(threshold, precision)) + geom_line() + geom_point() +
+  labs(title = "Precision Across LOF Thresholds",
+       x = "Quantile Threshold", y = "Precision")
+```
+
+Precision remains fairly steady in the lower range of thresholds, staying close to the 0.28 to 0.33 level. There is a brief dip around the 0.975 threshold. After that point I see a sharp increase in precision at the highest thresholds, reaching values around 0.50. This happens because the model labels only the most extreme outliers as cancer, which reduces false positives. The key question is whether these very high thresholds still produce at least seven true positives, since the clinical trial requires a minimum of seven confirmed cancer patients.
+
+## Additional Method: DBSCAN Outlier Detection
+
+I also use DBSCAN as a second outlier detection method. DBSCAN groups points that are close together and labels isolated points as noise. These noise points can be treated as possible cancer cases since they sit far from the main population pattern. To choose an eps value, I look at the k-NN distance plot. The curve rises sharply around a distance of about six to eight, which tells me that points beyond this distance are isolated. I set eps to six so that DBSCAN forms tight clusters and treats the more isolated patients as outliers.
+
+```{r}
+library(dbscan)
+kNN_dist <- kNNdist(pc_data, k = 10)
+plot(sort(kNN_dist),
+type = "l",
+main = "k-NN Distance Plot (k = 10)",
+ylab = "Distance")
+```
+
+### Running DBSCAN
+
+Using eps = 6 and minPts = 10, DBSCAN finds one main cluster and a small group of noise points. Noise points appear as cluster 0.
+
+```{r}
+eps_value <- 6  
+db_model <- dbscan::dbscan(pc_data, eps = eps_value, minPts = 10)
+table(db_model$cluster)
+```
+
+DBSCAN identified 363 patients as part of the main cluster and 15 patients as noise. These 15 noise points are the outliers that DBSCAN considers the most unusual.
+
+### Precision of DBSCAN
+
+DBSCAN finds 9 true cancer cases and 6 false positives, giving a precision of 0.6. This is much higher than the precision from the clustering model and meets the requirement of finding at least seven true positives. Although there are still false positives, DBSCAN performs better than K-means and shows that density-based outlier detection can be useful for identifying likely cancer cases.
+
+```{r}
+pred_dbscan <- ifelse(db_model$cluster == 0, "Cancer", "NoCancer")
+pred_dbscan <- factor(pred_dbscan, levels = c("NoCancer","Cancer"))
+dbscan_results <- evaluate_precision(pred_dbscan, wbc$y)
+dbscan_results
+```
+
+# (Q3) You are asked to build at least one clustering model to test the idea that we can use clustering as a cancer diagnoses methodology. Is the clustering model(s) effective in diagnosing insidence of Cancer among the patients?
+
+## Choosing the Number of Clusters
+
+I first check how many clusters the PCA-reduced data support. K-means requires a value for k, so I use WSS and silhouette diagnostics to choose the most reasonable number.
+
+```{r}
+set.seed(123)
+fviz_nbclust(pc_data, kmeans, method = "wss") + labs(title = "WSS Plot for Choosing k")
+```
+
+The elbow in the WSS plot is not very clear. This suggests that the dataset does not form strong, well-separated clusters. This makes it unlikely that cancer cases will fall into their own distinct group.
+
+```{r}
+set.seed(123)
+fviz_nbclust(pc_data, kmeans, method = "silhouette") + labs(title = "Silhouette Plot for Choosing k")
+```
+
+The silhouette plot shows its highest value at k = 2, but the value is modest. This indicates that two clusters are the best available choice, although the separation between them is weak. This weak separation already hints that clustering may not cleanly isolate cancer cases.
+
+## K-means Clustering
+
+Based on the diagnostics, I proceed with k = 2.
+
+```{r}
+set.seed(123)
+kmeans_model <- kmeans(pc_data, centers = 2, nstart = 25)
+cluster_labels <- factor(kmeans_model$cluster)
+table(cluster_labels)
+```
+
+The clustering resulted in 341 patients assigned to Cluster 1 and 37 patients assigned to Cluster 2. This strong imbalance suggests that most patients are grouped together, which limits the ability of clustering to isolate a distinct cancer-heavy cluster.
+
+# Checking Cancer Distribution Across Clusters
+
+```{r}
+table(cluster_labels, wbc$y)
+```
+
+Cluster 1 contains 335 non-cancer patients and 6 cancer patients.
+Cluster 2 contains 22 non-cancer patients and 15 cancer patients.
+
+This means the smaller cluster (Cluster 2) has a much higher cancer concentration, so I treat that cluster as the “cancer-leaning” group. However, Cluster 2 still contains many non-cancer cases, which reduces precision.
+
+# Converting Clusters into Predictions
+
+```{r}
+cluster_cancer_counts <- table(cluster_labels, wbc$y)
+cancer_cluster <- as.numeric(
+  rownames(cluster_cancer_counts)[which.max(cluster_cancer_counts[,"Cancer"])]
+)
+cluster_pred <- ifelse(cluster_labels == cancer_cluster, "Cancer", "NoCancer")
+cluster_pred <- factor(cluster_pred, levels = c("NoCancer","Cancer"))
+```
+
+Cluster 2 is chosen as the cancer cluster because it contains 15 cancer cases, which is much higher than the 6 in Cluster 1. All patients in Cluster 2 are labeled as “Cancer” and all others as “NoCancer.”
+
+# Precision of the Clustering Model
+
+```{r}
+cluster_results <- evaluate_precision(cluster_pred, wbc$y)
+cluster_results
+```
+
+This means that out of the 37 patients labeled as cancer, only 15 actually had cancer. This gives a precision of about 40 percent. Although the model correctly identifies more than seven true cancer patients, the number of false positives is too high for a clinical trial that requires strict precision.
+
+# (Q4) Now that you have at least two ways to figure out who might have cancer, focus on how you can increase Precision. 
+
+To increase precision, I make the model more selective. For LOF this means raising the threshold so that only the most extreme outliers are labeled as cancer. This reduces false positives and increases precision.
+
+## Raising the LOF Threshold
+
+I search for the highest threshold that still identifies at least seven true positives.
+
+```{r}
+subset_results <- results[results$TP >= 7, ]
+best_row <- subset_results[which.max(subset_results$precision), ]
+best_row
+```
+
+This gives me the best LOF quantile that maximizes precision while satisfying the requirement of at least seven cancer patients.
+
+### Recompute Predictions at the Best Threshold
+
+```{r}
+best_thr <- quantile(lof_scores, best_row$threshold)
+pred_best <- ifelse(lof_scores >= best_thr, "Cancer", "NoCancer")
+pred_best <- factor(pred_best, levels = c("NoCancer","Cancer"))
+final_precision <- evaluate_precision(pred_best, wbc$y)
+final_precision
+```
+
+This returns the confusion matrix, true positives, false positives, and the improved precision. Precision here is 0.3333333 which is higher than the other precisions previously. 
+
+## Increasing Precision using DBSCAN
+
+Test multiple eps values and select the one with the highest precision
+
+```{r}
+library(dbscan)
+
+eps_grid <- seq(4, 7, by = 0.25)
+dbscan_results_list <- data.frame()
+
+for(e in eps_grid){
+  model <- dbscan::dbscan(pc_data, eps = e, minPts = 10)
+  pred <- ifelse(model$cluster == 0, "Cancer", "NoCancer")
+  pred <- factor(pred, levels = c("NoCancer","Cancer"))
+  res <- evaluate_precision(pred, wbc$y)
+  dbscan_results_list <- rbind(dbscan_results_list,
+                               data.frame(eps = e, TP = res$TP, FP = res$FP,
+                                          precision = res$precision))
+}
+dbscan_results_list
+```
+
+### Choose the best eps that still gives at least 7 true positives
+
+```{r}
+valid <- dbscan_results_list[dbscan_results_list$TP >= 7, ]
+best_eps <- valid$eps[which.max(valid$precision)]
+best_eps
+```
+
+This value is higher than the previous 6 used.
+
+### Re-run DBSCAN using the best eps
+
+```{r}
+db_best <- dbscan::dbscan(pc_data, eps = best_eps, minPts = 10)
+pred_best <- ifelse(db_best$cluster == 0, "Cancer", "NoCancer")
+pred_best <- factor(pred_best, levels = c("NoCancer","Cancer"))
+dbscan_precision_best <- evaluate_precision(pred_best, wbc$y)
+dbscan_precision_best
+```
+
+Precsision increases to 0.7777778 from 0.6.
+
+## Increasing Precision Using K-means
+
+I tried to improve precision with K-means by adding more clusters and tightening the cancer-leaning cluster, but it did not work here. The cancer cases do not form a tight or clear group in this dataset, so K-means keeps mixing cancer and non-cancer patients, which lowers precision. In other datasets where groups are better separated, K-means could give higher precision by using more clusters or by removing noisy features to make the clusters cleaner. In contrast, the LOF outlier method performs much better. By raising the LOF threshold and selecting only the strongest outliers, I get a smaller and more reliable group of likely cancer patients. This gives higher precision while still finding at least seven true positives, so LOF is the better method for the clinical trial.
+
+# Conclusion
+
+This analysis set out to help Michigan Medicine identify a small group of patients who are very likely to have cancer so they can be considered for an expensive clinical trial. Since the goal was not to find every cancer case, the focus throughout was on precision and making sure the model avoided false positives while still identifying at least seven true cancer patients.
+
+From the results, clustering was not effective for this purpose. The K-means clusters did not form a clear separation between cancer and non-cancer patients, and the best clustering model reached a precision of only about 0.40, which is too low for a high-stakes clinical trial . Outlier detection performed much better. LOF was able to identify a focused set of likely cancer cases, and DBSCAN performed even stronger once eps was tuned. After testing different eps values, DBSCAN reached a precision of about 0.78 while still identifying the required seven true positives . This makes DBSCAN the most suitable unsupervised approach for this dataset.
+
+Overall, outlier detection methods proved far more reliable than clustering for high-precision cancer identification. A tuned DBSCAN model gives Michigan Medicine a practical way to narrow down a small, reliable group of patients who should be considered for the clinical trial.
+
